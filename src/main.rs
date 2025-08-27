@@ -1,6 +1,7 @@
-use std::io::{stdout, Write, IsTerminal};
-use std::process::Command;
+use std::io::{stdout, Write, IsTerminal, Read};
 use std::env;
+use std::thread;
+use std::sync::mpsc;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -9,6 +10,7 @@ use crossterm::{
     style::{self, Color, SetForegroundColor, ResetColor, Attribute},
 };
 use vte::{Parser, Perform};
+use pty_process::blocking::{Command, Pty};
 
 struct MyVteParser;
 
@@ -65,8 +67,6 @@ fn main() -> std::io::Result<()> {
     execute!(stdout, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
 
     let mut line = String::new();
-    let mut parser = Parser::new();
-    let mut performer = MyVteParser;
 
     loop {
         execute!(stdout, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
@@ -117,19 +117,39 @@ fn main() -> std::io::Result<()> {
                                 continue;
                             }
 
-                            let output = Command::new(command)
-                                .args(args)
-                                .output();
-
-                            match output {
-                                Ok(output) => {
+                            let pty = Pty::new().unwrap();
+                            let pts = pty.pts().unwrap();
+                            let mut cmd = Command::new(command);
+                            cmd.args(args);
+                            
+                            match cmd.spawn(&pts) {
+                                Ok(mut child) => {
                                     print!("\r\n");
-                                    for byte in output.stdout.iter() {
-                                        parser.advance(&mut performer, *byte);
-                                    }
-                                    for byte in output.stderr.iter() {
-                                        parser.advance(&mut performer, *byte);
-                                    }
+                                    drop(pts);
+
+                                    let (tx, rx) = mpsc::channel();
+                                    let mut pty_reader = pty;
+                                    let read_thread = thread::spawn(move || {
+                                        let mut buffer = [0u8; 1024];
+                                        let mut parser = Parser::new();
+                                        let mut performer = MyVteParser;
+                                        loop {
+                                            if rx.try_recv().is_ok() {
+                                                break;
+                                            }
+                                            let n = pty_reader.read(&mut buffer).unwrap();
+                                            if n == 0 {
+                                                break;
+                                            }
+                                            for byte in &buffer[..n] {
+                                                parser.advance(&mut performer, *byte);
+                                            }
+                                        }
+                                    });
+
+                                    child.wait().unwrap();
+                                    tx.send(()).unwrap();
+                                    read_thread.join().unwrap();
                                 }
                                 Err(e) => {
                                     println!("\r\nError: {}", e);
